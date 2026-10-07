@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Tweet Catcher</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Tweet Catcher</h1>
+
+  <label for="apiBase">Collector API</label>
+  <input id="apiBase" type="url" spellcheck="false" value="http://localhost:8000/api/v2/collector">
+
+  <label for="apiKey">Collector key</label>
+  <input id="apiKey" type="password" autocomplete="off" value="X_COLLECTOR_KEY">
+
+  <label for="collectorId">Collector name</label>
+  <input id="collectorId" type="text" maxlength="128" value="tweet-catcher">
+
+  <button id="saveBtn" type="button" class="secondary">Save settings</button>
+
+  <section class="status-card" aria-live="polite">
+    <div id="statusPhase" class="phase">Disabled</div>
+    <div id="statusMessage">Collector is disabled.</div>
+    <div id="statusProfile" class="profile"></div>
+    <div class="counts">
+      <span><strong id="acceptedCount">0</strong> added</span>
+      <span><strong id="duplicateCount">0</strong> known</span>
+      <span><strong id="rejectedCount">0</strong> skipped</span>
+    </div>
+    <div class="pending">
+      <div class="pending-title"><span id="pendingCount">0</span> not sent yet</div>
+      <ul id="pendingList"></ul>
+    </div>
+  </section>
+
+  <button id="enableBtn" type="button">Enable collector</button>
+  <button id="disableBtn" type="button" class="danger" hidden>Disable collector</button>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Tweet Catcher",
+  "version": "2.1.0",
+  "description": "Collects influencer posts from X for the MissPredict onboarding pipeline.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["https://x.com/*"],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "http://*:*/*",
+    "https://*:*/*"
+  ],
+  "background": {
+    "service_worker": "background-multi-window.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*"],
+      "js": ["collector.js"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
