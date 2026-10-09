@@ -150,6 +150,17 @@ function topLevelTweets() {
   );
 }
 
+function profilePostsAreProtected() {
+  if (topLevelTweets().length > 0) {
+    return false;
+  }
+
+  const text = (timelineRoot().innerText || "").replace(/\s+/g, " ");
+  return /\bthese (posts|tweets) are protected\b/i.test(text)
+    || /\bprotected posts\b/i.test(text)
+    || /\bposts are protected\b/i.test(text);
+}
+
 function timelineIsStillLoadingOrFailed() {
   const timeline = timelineRoot();
   const progressbars = Array.from(timeline.querySelectorAll('[role="progressbar"]')).filter(isVisible);
@@ -374,6 +385,11 @@ async function runCollector(job) {
   try {
     while (collecting) {
       queuePosts(extractVisiblePosts());
+      if (profilePostsAreProtected()) {
+        await finishCollection("protected_posts");
+        return;
+      }
+
       const waitingForText = unresolvedVisibleTweet();
       const loading = timelineIsStillLoadingOrFailed();
       await reportPending();
