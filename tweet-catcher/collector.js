@@ -158,7 +158,8 @@ function profilePostsAreProtected() {
   const text = (timelineRoot().innerText || "").replace(/\s+/g, " ");
   return /\bthese (posts|tweets) are protected\b/i.test(text)
     || /\bprotected posts\b/i.test(text)
-    || /\bposts are protected\b/i.test(text);
+    || /\bposts are protected\b/i.test(text)
+    || /diese (posts|tweets) sind geschützt/iu.test(text);
 }
 
 function timelineIsStillLoadingOrFailed() {
