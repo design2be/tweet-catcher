@@ -5,7 +5,7 @@ const MAX_EMPTY_SCANS = 8;
 const MAX_LOADING_WAITS = 12;
 const SAME_TWEET_SCANS = 3;
 const MAX_EXPAND_ATTEMPTS = 3;
-const EXPAND_WAIT_MS = 2500;
+const EXPAND_WAIT_MS = 1500;
 const HEARTBEAT_MS = 3 * 60 * 1000;
 const PENDING_PREVIEW_LIMIT = 40;
 
@@ -18,8 +18,6 @@ let skippedPostIds = new Set();
 let unresolvedAttempts = new Map();
 let expandAttempts = new Map();
 let expandingPostIds = new Set();
-let expandedPostIds = new Set();
-let expandChain = Promise.resolve();
 let heartbeatTimer = null;
 let timelineObserver = null;
 let watchScheduled = false;
@@ -117,14 +115,14 @@ function extractVisiblePosts() {
       return;
     }
 
-    // The timeline omits the rest of a long post until its Show more anchor is opened.
-    if (!expandedPostIds.has(details.externalId) && (
+    // The timeline omits the rest of a long post until Show more is opened.
+    if (
       expandingPostIds.has(details.externalId)
       || (
         tweetShowMoreLink(tweet)
         && (expandAttempts.get(details.externalId) || 0) < MAX_EXPAND_ATTEMPTS
       )
-    )) {
+    ) {
       return;
     }
 
@@ -202,80 +200,25 @@ function continuationButton() {
   }) || null;
 }
 
-function tweetCell(tweet) {
-  return tweet.closest('[data-testid="cellInnerDiv"]') || tweet.closest("article") || tweet;
-}
-
-function elementBelongsToTweet(element, tweet) {
-  let owner = element.closest('[data-testid="tweet"]');
-  if (!owner) {
-    const cell = tweet.closest('[data-testid="cellInnerDiv"]');
-    return Boolean(cell && cell.contains(element));
-  }
-
-  // The same post can nest data-testid="tweet" on a wrapper div. A quoted
-  // post is a nested article and belongs to itself.
-  while (owner && owner !== tweet && owner.tagName !== "ARTICLE") {
-    owner = owner.parentElement?.closest('[data-testid="tweet"]') || null;
-  }
-  return owner === tweet;
-}
-
-function isShowMoreLabel(element) {
-  const label = (element.innerText || element.textContent || "")
-    .replace(/\s+/g, " ")
-    .trim();
-  return /^(?:…|\.\.\.)?\s*(show more|mehr anzeigen)$/i.test(label);
-}
-
 function tweetShowMoreLink(tweet) {
-  const root = tweetCell(tweet);
-  const anchors = Array.from(root.querySelectorAll("a")).filter(element => elementBelongsToTweet(element, tweet));
-  const anchor = anchors.find(isShowMoreLabel);
-  if (anchor) {
-    return anchor;
-  }
-
-  const label = Array.from(root.querySelectorAll("span")).find(element => {
-    if (!elementBelongsToTweet(element, tweet) || !isShowMoreLabel(element)) {
-      return false;
-    }
-    const owner = element.closest("a");
-    if (!owner || !anchors.includes(owner)) {
-      return false;
-    }
-    const ownerText = (owner.innerText || owner.textContent || "").replace(/\s+/g, " ").trim();
-    return ownerText.length <= 40;
-  });
-  if (label) {
-    return label.closest("a");
-  }
-
-  const control = Array.from(root.querySelectorAll('[data-testid="tweet-text-show-more-link"]')).find(
-    element => elementBelongsToTweet(element, tweet)
-  );
-  if (!control) {
-    return null;
-  }
-
-  return control.closest("a") || control.querySelector("a") || control;
-}
-
-function ownTweetText(tweet) {
-  return Array.from(tweet.querySelectorAll('[data-testid="tweetText"]')).find(
+  const byTestId = Array.from(tweet.querySelectorAll('[data-testid="tweet-text-show-more-link"]')).find(
     element => element.closest('[data-testid="tweet"]') === tweet
-  )?.textContent?.trim() || "";
-}
+  );
+  if (byTestId) {
+    return byTestId.matches("button, [role='button'], a")
+      ? byTestId
+      : (byTestId.querySelector("button, [role='button'], a") || byTestId);
+  }
 
-function tweetBodyLength(tweet) {
-  return ownTweetText(tweet)
-    .replace(/(?:\s|^)(show more|mehr anzeigen)\s*$/i, "")
-    .trim()
-    .length;
-}
-
-function findTweet(externalId) {
-  return topLevelTweets().find(tweet => statusDetails(tweet)?.externalId === externalId) || null;
+  return Array.from(tweet.querySelectorAll('button, [role="button"], a')).find(element => {
+    if (element.closest('[data-testid="tweet"]') !== tweet) {
+      return false;
+    }
+    const label = (element.getAttribute("aria-label") || element.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return /^(show more|mehr anzeigen)$/i.test(label);
+  }) || null;
 }
 
 function tweetsStillNeedExpansion() {
@@ -290,7 +233,6 @@ function tweetsStillNeedExpansion() {
       !details
       || details.handle.toLowerCase() !== expectedHandle
       || seenPostIds.has(details.externalId)
-      || expandedPostIds.has(details.externalId)
       || !tweetShowMoreLink(tweet)
     ) {
       return false;
@@ -299,17 +241,15 @@ function tweetsStillNeedExpansion() {
   });
 }
 
-function activateShowMore(anchor) {
-  const rect = anchor.getBoundingClientRect();
-  const offScreen = rect.bottom <= 0 || rect.top >= window.innerHeight || rect.width === 0 || rect.height === 0;
-  if (offScreen) {
-    anchor.scrollIntoView({ block: "center", inline: "nearest" });
+function activateShowMore(showMore) {
+  if (showMore.tagName === "A") {
+    showMore.addEventListener("click", event => event.preventDefault(), { capture: true, once: true });
   }
-  anchor.click();
+  showMore.click();
 }
 
-// Long posts only render a preview until the Show more anchor is opened.
-async function expandTruncatedTweetsNow() {
+// Long posts only render a preview until this control is opened.
+async function expandTruncatedTweets() {
   const expectedHandle = currentJob?.profile?.xHandle?.toLowerCase();
   if (!expectedHandle) {
     return false;
@@ -325,7 +265,6 @@ async function expandTruncatedTweetsNow() {
       || !showMore
       || seenPostIds.has(details.externalId)
       || skippedPostIds.has(details.externalId)
-      || expandedPostIds.has(details.externalId)
     ) {
       return;
     }
@@ -335,60 +274,27 @@ async function expandTruncatedTweetsNow() {
       return;
     }
 
-    expandAttempts.set(details.externalId, attempts + 1);
-    expandingPostIds.add(details.externalId);
     pending.push({
       id: details.externalId,
-      before: tweetBodyLength(tweet)
+      showMore
     });
-    activateShowMore(showMore);
   });
 
-  if (pending.length) {
-    const deadline = Date.now() + EXPAND_WAIT_MS;
-    try {
-      while (Date.now() < deadline) {
-        const waiting = pending.some(({ id, before }) => {
-          if (expandedPostIds.has(id)) {
-            return false;
-          }
-          const current = findTweet(id);
-          if (!current) {
-            return true;
-          }
-          if (tweetBodyLength(current) > before) {
-            expandedPostIds.add(id);
-            return false;
-          }
-          return true;
-        });
-        if (!waiting) {
-          break;
-        }
-        await sleep(80);
-      }
-    } finally {
-      pending.forEach(({ id, before }) => {
-        const current = findTweet(id);
-        const extended = current && tweetBodyLength(current) > before;
-        const exhausted = (expandAttempts.get(id) || 0) >= MAX_EXPAND_ATTEMPTS;
-        if (extended) {
-          expandedPostIds.add(id);
-        }
-        if (extended || exhausted || !current) {
-          expandingPostIds.delete(id);
-        }
-      });
+  for (const { id, showMore } of pending) {
+    if (!collecting) {
+      break;
     }
+
+    expandAttempts.set(id, (expandAttempts.get(id) || 0) + 1);
+    expandingPostIds.add(id);
+    activateShowMore(showMore);
+    // The expanded text arrives after the click, so wait before reading this post
+    // or moving on to the next one.
+    await sleep(EXPAND_WAIT_MS);
+    expandingPostIds.delete(id);
   }
 
   return tweetsStillNeedExpansion();
-}
-
-function expandTruncatedTweets() {
-  const run = expandChain.then(() => expandTruncatedTweetsNow());
-  expandChain = run.then(() => {}, () => {});
-  return run;
 }
 
 function queuePosts(posts) {
@@ -510,11 +416,7 @@ function watchTimeline() {
       if (!collecting) {
         return;
       }
-      expandTruncatedTweets().then(() => {
-        if (collecting) {
-          queuePosts(extractVisiblePosts());
-        }
-      });
+      queuePosts(extractVisiblePosts());
     });
   });
   timelineObserver.observe(document.documentElement, { childList: true, subtree: true });
@@ -581,8 +483,6 @@ async function runCollector(job) {
   unresolvedAttempts = new Map();
   expandAttempts = new Map();
   expandingPostIds = new Set();
-  expandedPostIds = new Set();
-  expandChain = Promise.resolve();
   reportedPendingKey = "";
   let emptyScans = 0;
   let loadingWaits = 0;
