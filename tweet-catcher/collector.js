@@ -3,7 +3,7 @@ const BATCH_SIZE = 5;
 const SCAN_DELAY_MS = 1800;
 const MAX_EMPTY_SCANS = 8;
 const MAX_LOADING_WAITS = 12;
-const SAME_TWEET_SCANS = 3;
+const SAME_TWEET_SCANS = 4;
 const MAX_EXPAND_ATTEMPTS = 3;
 const EXPAND_WAIT_MS = 1500;
 const HEARTBEAT_MS = 3 * 60 * 1000;
@@ -96,7 +96,7 @@ function detectPostType(tweet) {
   return "post";
 }
 
-function extractVisiblePosts() {
+function extractVisiblePosts(tweets = null, keepTruncated = false) {
   if (!currentJob?.profile?.xHandle) {
     return [];
   }
@@ -104,11 +104,7 @@ function extractVisiblePosts() {
   const expectedHandle = currentJob.profile.xHandle.toLowerCase();
   const posts = [];
 
-  document.querySelectorAll('[data-testid="tweet"]').forEach(tweet => {
-    if (tweet.parentElement?.closest('[data-testid="tweet"]')) {
-      return;
-    }
-
+  (tweets || topLevelTweets()).forEach(tweet => {
     const details = statusDetails(tweet);
     if (
       !details
@@ -119,11 +115,16 @@ function extractVisiblePosts() {
     }
 
     // The timeline omits the rest of a long post until Show more is opened.
+    // A post that is leaving the DOM is saved as shown, so virtualization
+    // cannot drop it before the profile is marked done.
     if (
-      expandingPostIds.has(details.externalId)
-      || (
-        tweetShowMoreLink(tweet)
-        && (expandAttempts.get(details.externalId) || 0) < MAX_EXPAND_ATTEMPTS
+      !keepTruncated
+      && (
+        expandingPostIds.has(details.externalId)
+        || (
+          tweetShowMoreLink(tweet)
+          && (expandAttempts.get(details.externalId) || 0) < MAX_EXPAND_ATTEMPTS
+        )
       )
     ) {
       return;
@@ -165,10 +166,12 @@ function timelineRoot() {
   return document.querySelector('[data-testid="primaryColumn"]') || document.body;
 }
 
-function topLevelTweets() {
-  return Array.from(document.querySelectorAll('[data-testid="tweet"]')).filter(
-    tweet => !tweet.parentElement?.closest('[data-testid="tweet"]')
-  );
+function topLevelTweets(root = document) {
+  const matchesRoot = root.nodeType === 1 && root.matches?.('[data-testid="tweet"]');
+  const nodes = matchesRoot
+    ? [root, ...root.querySelectorAll('[data-testid="tweet"]')]
+    : Array.from(root.querySelectorAll?.('[data-testid="tweet"]') || []);
+  return nodes.filter(tweet => !tweet.parentElement?.closest('[data-testid="tweet"]'));
 }
 
 function profilePostsAreProtected() {
@@ -512,10 +515,35 @@ function nudgeScroller(node, delta) {
   return node.scrollTop > before + 1;
 }
 
+function cellOffset() {
+  const cell = markerCell();
+  if (!cell) {
+    return null;
+  }
+  return cell.getBoundingClientRect().top;
+}
+
+function renderedEndIsVisible() {
+  const cell = markerCell();
+  if (!cell) {
+    return false;
+  }
+  const rect = cell.getBoundingClientRect();
+  // Virtualized rows keep a buffer below the viewport. The rendered end is only
+  // on screen once that buffer has been scrolled up to the window.
+  return rect.top < window.innerHeight && rect.bottom <= window.innerHeight + BOTTOM_SLOP;
+}
+
+function windowHasRoom() {
+  const doc = document.scrollingElement || document.documentElement;
+  return distanceFromBottom(doc) > BOTTOM_SLOP;
+}
+
 function scrollFurther() {
   // Step most of a viewport and leave the previous rows on screen.
   // scrollIntoView on the last cell jumps X's virtual timeline and it reloads.
   const delta = Math.round(Math.max(window.innerHeight * 0.72, 480));
+  const before = cellOffset();
   const scroller = chooseScroller();
   const roomBefore = distanceFromBottom(scroller);
   const moved = nudgeScroller(scroller, delta);
@@ -526,12 +554,26 @@ function scrollFurther() {
   const doc = document.scrollingElement || document.documentElement;
   const docMoved = doc !== scroller && nudgeScroller(doc, delta);
   let windowMoved = false;
-  if (!moved && !docMoved) {
-    const before = window.scrollY;
+  const afterNudge = cellOffset();
+  const cellsMoved = before !== null && afterNudge !== null && afterNudge < before - 1;
+  // X loads the next page from the window scroll position. A nested box can
+  // report that it moved while the timeline on screen stays on the first posts.
+  if (!cellsMoved && (windowHasRoom() || !moved)) {
+    const scrollBefore = window.scrollY;
     window.scrollBy(0, delta);
-    windowMoved = window.scrollY > before + 1;
+    windowMoved = window.scrollY > scrollBefore + 1;
   }
-  lastScrollMoved = moved || docMoved || windowMoved;
+  const after = cellOffset();
+  const timelineMoved = before !== null && after !== null && after < before - 1;
+  lastScrollMoved = timelineMoved || moved || docMoved || windowMoved;
+}
+
+async function retriggerLoader() {
+  const delta = Math.round(Math.max(window.innerHeight * 0.6, 360));
+  window.scrollBy(0, -delta);
+  await sleep(400);
+  window.scrollBy(0, delta);
+  await sleep(SCAN_DELAY_MS);
 }
 
 function summarizePost(post) {
@@ -565,8 +607,23 @@ function watchTimeline() {
     timelineObserver.disconnect();
   }
   watchScheduled = false;
-  timelineObserver = new MutationObserver(() => {
-    if (!collecting || watchScheduled) {
+  timelineObserver = new MutationObserver(mutations => {
+    if (!collecting) {
+      return;
+    }
+    const removed = [];
+    mutations.forEach(mutation => {
+      mutation.removedNodes.forEach(node => {
+        if (node.nodeType !== 1) {
+          return;
+        }
+        removed.push(...topLevelTweets(node));
+      });
+    });
+    if (removed.length) {
+      queuePosts(extractVisiblePosts(removed, true));
+    }
+    if (watchScheduled) {
       return;
     }
     watchScheduled = true;
@@ -654,6 +711,7 @@ async function runCollector(job) {
   let emptyScans = 0;
   let loadingWaits = 0;
   let sameTweetScans = 0;
+  let stuckScans = 0;
   let lastVisibleKey = "";
   let lastScrollHeight = 0;
 
@@ -680,12 +738,8 @@ async function runCollector(job) {
       await reportPending();
 
       while (collecting && pendingPosts.length > 0) {
-        const uploaded = await flushPosts(true);
+        await flushPosts(true);
         await reportPending(true);
-        if (uploaded.stop && currentJob.mode === "update") {
-          await finishCollection(uploaded.stopReason || "known_collection_boundary");
-          return;
-        }
       }
 
       if (!collecting) {
@@ -697,9 +751,10 @@ async function runCollector(job) {
       const doc = document.scrollingElement || document.documentElement;
       const timelineHeight = Math.max(scroller.scrollHeight, doc.scrollHeight);
       const grew = timelineHeight > lastScrollHeight + 40;
-      // Room left on any real timeline scroller. The bottom of an expanded post
-      // does not count; that box is excluded from the candidates.
-      const atBottom = !timelineHasRoom();
+      // The page can still be holding posts below the first screen while a nested
+      // box reports no room. Both the window and the rendered last cell have to
+      // be at the bottom before the profile can be marked done.
+      const atBottom = !windowHasRoom() && !timelineHasRoom() && renderedEndIsVisible();
       if (grew) {
         lastScrollHeight = timelineHeight;
       }
@@ -744,18 +799,22 @@ async function runCollector(job) {
           await sleep(SCAN_DELAY_MS);
           continue;
         }
-        if (blocked) {
-          throw new Error(
-            seenPostIds.size === 0
-              ? "No posts were visible. Check that X is logged in and the profile is public."
-              : "The X timeline stopped loading before the bottom. Collection will retry."
-          );
-        }
+        throw new Error(
+          seenPostIds.size === 0
+            ? "No posts were visible. Check that X is logged in and the profile is public."
+            : "The X timeline stopped loading before the bottom. Collection will retry."
+        );
       }
 
       if (!atBottom || lastScrollMoved) {
-        if (lastScrollMoved) {
+        if (lastScrollMoved || grew) {
           sameTweetScans = 0;
+          stuckScans = 0;
+        } else if (!windowHasRoom() && !timelineHasRoom()) {
+          stuckScans++;
+          if (stuckScans >= MAX_EMPTY_SCANS) {
+            throw new Error("The X timeline stopped loading before the bottom. Collection will retry.");
+          }
         }
         scrollFurther();
         await sleep(SCAN_DELAY_MS + Math.floor(Math.random() * 700));
@@ -764,9 +823,29 @@ async function runCollector(job) {
 
       loadingWaits = 0;
       sameTweetScans++;
-      if (sameTweetScans >= SAME_TWEET_SCANS && !grew && !lastScrollMoved) {
-        // Onboarding ends at the bottom. An update usually ends earlier, when
-        // stored posts repeat, and only falls through to here if the timeline ends.
+      if (sameTweetScans >= SAME_TWEET_SCANS && !grew && !lastScrollMoved && atBottom) {
+        const seenBeforeKick = seenPostIds.size;
+        const heightBeforeKick = timelineHeight;
+        await retriggerLoader();
+        queuePosts(extractVisiblePosts());
+        const heightAfterKick = Math.max(
+          chooseScroller().scrollHeight,
+          (document.scrollingElement || document.documentElement).scrollHeight
+        );
+        if (
+          seenPostIds.size > seenBeforeKick
+          || heightAfterKick > heightBeforeKick + 40
+          || windowHasRoom()
+          || timelineHasRoom()
+          || timelineIsLoadingMore()
+          || !renderedEndIsVisible()
+        ) {
+          sameTweetScans = 0;
+          lastScrollHeight = heightAfterKick;
+          scrollFurther();
+          await sleep(SCAN_DELAY_MS);
+          continue;
+        }
         await finishCollection("timeline_exhausted");
         return;
       }

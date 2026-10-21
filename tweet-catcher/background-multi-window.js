@@ -326,7 +326,7 @@ async function uploadBatch(sender, posts) {
   }
   await updateState(job.windowId, {
     phase: "collecting",
-    message: result.stop ? "Known post boundary reached." : `Collecting @${job.profile.xHandle}`,
+    message: `Collecting @${job.profile.xHandle}`,
     accepted: updatedJob.accepted,
     duplicates: updatedJob.duplicates,
     rejected: updatedJob.rejected
