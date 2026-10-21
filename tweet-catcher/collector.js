@@ -22,6 +22,9 @@ let heartbeatTimer = null;
 let timelineObserver = null;
 let watchScheduled = false;
 let reportedPendingKey = "";
+let timelineScrollerNode = null;
+let rejectedScrollers = new Set();
+let lastScrollMoved = true;
 
 function sendCollectorMessage(message) {
   return new Promise((resolve, reject) => {
@@ -152,7 +155,10 @@ function extractVisiblePosts() {
 
 function isVisible(element) {
   const rect = element.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
+  return rect.width > 0
+    && rect.height > 0
+    && rect.bottom > 0
+    && rect.top < window.innerHeight;
 }
 
 function timelineRoot() {
@@ -177,47 +183,57 @@ function profilePostsAreProtected() {
     || /diese (posts|tweets) sind geschützt/iu.test(text);
 }
 
-function timelineIsStillLoadingOrFailed() {
-  const timeline = timelineRoot();
-  const progressbars = Array.from(timeline.querySelectorAll('[role="progressbar"]')).filter(isVisible);
-  const loadingMore = progressbars.some(element => element.getBoundingClientRect().top > window.innerHeight * 0.55);
-  if (loadingMore || (seenPostIds.size === 0 && progressbars.length > 0)) {
-    return true;
-  }
-
-  return Array.from(timeline.querySelectorAll('button, [role="button"], [role="alert"]')).some(element =>
-    isVisible(element)
-    && /\b(retry|try again|something went wrong|rate limit)\b/i.test(element.textContent || "")
-  );
+function timelineIsLoadingMore() {
+  const progressbars = Array.from(timelineRoot().querySelectorAll('[role="progressbar"]')).filter(isVisible);
+  return progressbars.some(element => element.getBoundingClientRect().top > window.innerHeight * 0.55)
+    || (seenPostIds.size === 0 && progressbars.length > 0);
 }
 
-function continuationButton() {
-  return Array.from(timelineRoot().querySelectorAll('button, [role="button"]')).find(element => {
-    if (!isVisible(element) || element.closest('[data-testid="tweet"]')) {
-      return false;
-    }
-    return /\b(show more|retry|try again)\b/i.test(element.textContent || "");
-  }) || null;
-}
-
-function tweetShowMoreLink(tweet) {
-  const byTestId = Array.from(tweet.querySelectorAll('[data-testid="tweet-text-show-more-link"]')).find(
-    element => element.closest('[data-testid="tweet"]') === tweet
-  );
-  if (byTestId) {
-    return byTestId.matches("button, [role='button'], a")
-      ? byTestId
-      : (byTestId.querySelector("button, [role='button'], a") || byTestId);
-  }
-
-  return Array.from(tweet.querySelectorAll('button, [role="button"], a')).find(element => {
-    if (element.closest('[data-testid="tweet"]') !== tweet) {
+function timelineIsBlocked() {
+  return Array.from(timelineRoot().querySelectorAll('button, [role="button"], [role="alert"]')).some(element => {
+    if (!isVisible(element)) {
       return false;
     }
     const label = (element.getAttribute("aria-label") || element.textContent || "")
       .replace(/\s+/g, " ")
       .trim();
-    return /^(show more|mehr anzeigen)$/i.test(label);
+    return /\b(retry|try again|something went wrong|rate limit|erneut versuchen)\b/i.test(label);
+  });
+}
+
+function continuationButton() {
+  return Array.from(timelineRoot().querySelectorAll('button, [role="button"]')).find(element => {
+    if (
+      !isVisible(element)
+      || element.closest("a[href], [data-testid='tweet'], [data-testid='UserDescription'], [data-testid='UserProfileHeader'], [data-testid='UserName']")
+    ) {
+      return false;
+    }
+    const label = (element.getAttribute("aria-label") || element.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    // Match the control itself. A wrapper's text includes every "Show more" on screen,
+    // and clicking that wrapper can navigate away before the profile is finalized.
+    return /^(show more|mehr anzeigen|retry|try again|erneut versuchen)$/i.test(label);
+  }) || null;
+}
+
+function controlLabel(element) {
+  return (element.getAttribute("aria-label") || element.innerText || element.textContent || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tweetShowMoreLink(tweet) {
+  return Array.from(tweet.querySelectorAll(
+    '[data-testid="tweet-text-show-more-link"], button, [role="button"], a'
+  )).find(element => {
+    if (element.closest('[data-testid="tweet"]') !== tweet) {
+      return false;
+    }
+    // The control's own label only. A wrapper's text includes the post, and
+    // clicking that wrapper opens the permalink instead of expanding the post.
+    return /^(show more|mehr anzeigen)$/i.test(controlLabel(element));
   }) || null;
 }
 
@@ -242,10 +258,36 @@ function tweetsStillNeedExpansion() {
 }
 
 function activateShowMore(showMore) {
-  if (showMore.tagName === "A") {
-    showMore.addEventListener("click", event => event.preventDefault(), { capture: true, once: true });
+  const rect = showMore.getBoundingClientRect();
+  const offScreen = rect.height > 0 && (rect.bottom <= 0 || rect.top >= window.innerHeight);
+  if (offScreen) {
+    // scrollIntoView picks the nearest overflow box. After Show more, that box
+    // is the expanded post, so the timeline itself never advances.
+    const delta = rect.top - Math.round(window.innerHeight * 0.4);
+    const scroller = chooseScroller();
+    if (isDocumentScroller(scroller)) {
+      window.scrollBy(0, delta);
+    } else {
+      scroller.scrollTop += delta;
+    }
   }
-  showMore.click();
+
+  // Show more is often a link to the status page. Expanding it must not navigate,
+  // or the content script restarts and the profile is loaded again from the top.
+  const href = showMore.tagName === "A" ? showMore.getAttribute("href") : null;
+  if (href) {
+    showMore.removeAttribute("href");
+  }
+  const preventNavigation = event => event.preventDefault();
+  showMore.addEventListener("click", preventNavigation, true);
+  try {
+    showMore.click();
+  } finally {
+    showMore.removeEventListener("click", preventNavigation, true);
+    if (href) {
+      showMore.setAttribute("href", href);
+    }
+  }
 }
 
 // Long posts only render a preview until this control is opened.
@@ -354,25 +396,142 @@ function unresolvedVisibleTweet() {
   });
 }
 
-function scrollFurther() {
+const BOTTOM_SLOP = 80;
+
+function markerCell() {
   const cells = document.querySelectorAll('[data-testid="cellInnerDiv"]');
-  const target = cells.length ? cells[cells.length - 1] : topLevelTweets().at(-1);
-  if (target) {
-    target.scrollIntoView({ block: "start", inline: "nearest", behavior: "auto" });
+  return (cells.length ? cells[cells.length - 1] : topLevelTweets().at(-1)) || null;
+}
+
+function distanceFromBottom(node) {
+  if (!node) {
+    return 0;
   }
+  return node.scrollHeight - node.clientHeight - node.scrollTop;
+}
 
-  const delta = Math.max(window.innerHeight, 700);
-  window.scrollBy(0, delta);
-  const scrollingElement = document.scrollingElement || document.documentElement;
-  scrollingElement.scrollTop += delta;
+function isDocumentScroller(node) {
+  return !!node && node === (document.scrollingElement || document.documentElement);
+}
 
-  let node = target?.parentElement || null;
-  while (node && node !== document.documentElement) {
-    if (node.scrollHeight > node.clientHeight + 40) {
-      node.scrollTop += delta;
+// A clipped, expanded post can overflow a box taller than the loaded timeline.
+// That box is not the feed. Only a scroller that contains the timeline cells,
+// or the document itself, can tell us whether the profile has more posts.
+function timelineScrollerCandidates() {
+  const candidates = [];
+  const seen = new Set();
+  const add = node => {
+    if (!node || seen.has(node) || rejectedScrollers.has(node) || node.nodeType !== 1) {
+      return;
     }
+    seen.add(node);
+    if (node.closest("[data-testid='tweet'], [data-testid='cellInnerDiv']")) {
+      return;
+    }
+    // body and documentElement both report the page height, but only the
+    // scrolling element moves. The other one always looks like it has room.
+    if ((node === document.body || node === document.documentElement) && !isDocumentScroller(node)) {
+      return;
+    }
+    const isDocument = isDocumentScroller(node);
+    if (!isDocument && node.querySelectorAll('[data-testid="cellInnerDiv"]').length < 2) {
+      return;
+    }
+    if (node.scrollHeight <= node.clientHeight + 40) {
+      return;
+    }
+    if (!isDocument) {
+      const overflowY = window.getComputedStyle(node).overflowY;
+      // overflow:hidden is included because X's timeline scroller uses it.
+      // A clipped post uses it too, but that box sits inside one cell and was
+      // already excluded above.
+      if (
+        overflowY !== "auto"
+        && overflowY !== "scroll"
+        && overflowY !== "overlay"
+        && overflowY !== "hidden"
+      ) {
+        return;
+      }
+    }
+    candidates.push(node);
+  };
+
+  let node = markerCell()?.parentElement || timelineRoot();
+  while (node) {
+    add(node);
     node = node.parentElement;
   }
+  add(document.scrollingElement);
+  add(document.documentElement);
+  add(document.body);
+  return candidates;
+}
+
+function timelineHasRoom() {
+  return timelineScrollerCandidates().some(node => distanceFromBottom(node) > BOTTOM_SLOP);
+}
+
+function chooseScroller() {
+  const candidates = timelineScrollerCandidates();
+  if (
+    timelineScrollerNode?.isConnected
+    && candidates.includes(timelineScrollerNode)
+    && distanceFromBottom(timelineScrollerNode) > BOTTOM_SLOP
+  ) {
+    return timelineScrollerNode;
+  }
+
+  let best = null;
+  let bestRoom = -1;
+  for (const node of candidates) {
+    const room = distanceFromBottom(node);
+    if (room > bestRoom) {
+      best = node;
+      bestRoom = room;
+    }
+  }
+
+  timelineScrollerNode = best || document.scrollingElement || document.documentElement;
+  return timelineScrollerNode;
+}
+
+function nudgeScroller(node, delta) {
+  if (!node) {
+    return false;
+  }
+  const before = node.scrollTop;
+  const room = distanceFromBottom(node);
+  if (room <= 1) {
+    return false;
+  }
+  // Land on the edge when close. Stopping short never trips X's loader, so the
+  // current slice looks like the end of the profile.
+  const step = room <= BOTTOM_SLOP ? room : Math.min(delta, room);
+  node.scrollTop = before + step;
+  return node.scrollTop > before + 1;
+}
+
+function scrollFurther() {
+  // Step most of a viewport and leave the previous rows on screen.
+  // scrollIntoView on the last cell jumps X's virtual timeline and it reloads.
+  const delta = Math.round(Math.max(window.innerHeight * 0.72, 480));
+  const scroller = chooseScroller();
+  const roomBefore = distanceFromBottom(scroller);
+  const moved = nudgeScroller(scroller, delta);
+  if (!moved && roomBefore > BOTTOM_SLOP) {
+    rejectedScrollers.add(scroller);
+    timelineScrollerNode = null;
+  }
+  const doc = document.scrollingElement || document.documentElement;
+  const docMoved = doc !== scroller && nudgeScroller(doc, delta);
+  let windowMoved = false;
+  if (!moved && !docMoved) {
+    const before = window.scrollY;
+    window.scrollBy(0, delta);
+    windowMoved = window.scrollY > before + 1;
+  }
+  lastScrollMoved = moved || docMoved || windowMoved;
 }
 
 function summarizePost(post) {
@@ -456,17 +615,22 @@ async function finishCollection(reason, hasMore = false) {
   }
   await reportPending(true);
 
-  stopping = true;
-  try {
-    await sendCollectorMessage({
-      type: "COMPLETE_COLLECTION",
-      reason,
-      hasMore
-    });
-  } catch (error) {
-    stopping = false;
-    throw error;
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await sendCollectorMessage({
+        type: "COMPLETE_COLLECTION",
+        reason,
+        hasMore
+      });
+      stopping = true;
+      return;
+    } catch (error) {
+      lastError = error;
+      await sleep(1000 * (attempt + 1));
+    }
   }
+  throw lastError;
 }
 
 async function runCollector(job) {
@@ -484,10 +648,14 @@ async function runCollector(job) {
   expandAttempts = new Map();
   expandingPostIds = new Set();
   reportedPendingKey = "";
+  timelineScrollerNode = null;
+  rejectedScrollers = new Set();
+  lastScrollMoved = true;
   let emptyScans = 0;
   let loadingWaits = 0;
   let sameTweetScans = 0;
   let lastVisibleKey = "";
+  let lastScrollHeight = 0;
 
   await sendCollectorMessage({ type: "COLLECTION_STARTED" });
   await reportPending(true);
@@ -507,7 +675,8 @@ async function runCollector(job) {
       }
 
       const waitingForText = unresolvedVisibleTweet();
-      const loading = timelineIsStillLoadingOrFailed();
+      const loading = timelineIsLoadingMore();
+      const blocked = timelineIsBlocked();
       await reportPending();
 
       while (collecting && pendingPosts.length > 0) {
@@ -523,32 +692,25 @@ async function runCollector(job) {
         return;
       }
 
-      if (loading || waitingForText || waitingForExpansion) {
-        sameTweetScans = 0;
-        loadingWaits++;
-        if (loadingWaits >= MAX_LOADING_WAITS) {
-          throw new Error(
-            seenPostIds.size === 0
-              ? "No posts were visible. Check that X is logged in and the profile is public."
-              : "The X timeline stopped loading before the bottom. Collection will retry."
-          );
-        }
-        const button = continuationButton();
-        if (button) {
-          button.click();
-        }
-        await sleep(SCAN_DELAY_MS);
-        continue;
+      const visibleKey = visibleTweetKey();
+      const scroller = chooseScroller();
+      const doc = document.scrollingElement || document.documentElement;
+      const timelineHeight = Math.max(scroller.scrollHeight, doc.scrollHeight);
+      const grew = timelineHeight > lastScrollHeight + 40;
+      // Room left on any real timeline scroller. The bottom of an expanded post
+      // does not count; that box is excluded from the candidates.
+      const atBottom = !timelineHasRoom();
+      if (grew) {
+        lastScrollHeight = timelineHeight;
       }
 
-      loadingWaits = 0;
-
-      const visibleKey = visibleTweetKey();
       if (!visibleKey) {
         sameTweetScans = 0;
         lastVisibleKey = "";
         emptyScans++;
-        if (emptyScans >= MAX_EMPTY_SCANS) {
+        // A blank gap while posts are already saved is the virtualizer catching
+        // up. Failing here releases the lease and reloads the profile.
+        if (emptyScans >= MAX_EMPTY_SCANS && seenPostIds.size === 0 && !loading) {
           throw new Error("No posts were visible. Check that X is logged in and the profile is public.");
         }
         scrollFurther();
@@ -557,14 +719,52 @@ async function runCollector(job) {
       }
 
       emptyScans = 0;
-      if (visibleKey === lastVisibleKey) {
-        sameTweetScans++;
-      } else {
-        sameTweetScans = 1;
+      const keyChanged = visibleKey !== lastVisibleKey;
+      if (grew || keyChanged || !atBottom) {
         lastVisibleKey = visibleKey;
+        sameTweetScans = 0;
+        if (grew || keyChanged) {
+          loadingWaits = 0;
+        }
       }
 
-      if (sameTweetScans >= SAME_TWEET_SCANS) {
+      if (loading || blocked || waitingForText || waitingForExpansion) {
+        const button = continuationButton();
+        if (button) {
+          button.click();
+        }
+        loadingWaits++;
+        // A spinner, a blocked timeline, or a post that is still expanding is
+        // not the end of the feed. Give the loader time, then retry the job
+        // instead of marking the profile fully scraped.
+        if (waitingForText || waitingForExpansion || !atBottom || loadingWaits < MAX_LOADING_WAITS) {
+          if (!waitingForText && !waitingForExpansion) {
+            scrollFurther();
+          }
+          await sleep(SCAN_DELAY_MS);
+          continue;
+        }
+        if (blocked) {
+          throw new Error(
+            seenPostIds.size === 0
+              ? "No posts were visible. Check that X is logged in and the profile is public."
+              : "The X timeline stopped loading before the bottom. Collection will retry."
+          );
+        }
+      }
+
+      if (!atBottom || lastScrollMoved) {
+        if (lastScrollMoved) {
+          sameTweetScans = 0;
+        }
+        scrollFurther();
+        await sleep(SCAN_DELAY_MS + Math.floor(Math.random() * 700));
+        continue;
+      }
+
+      loadingWaits = 0;
+      sameTweetScans++;
+      if (sameTweetScans >= SAME_TWEET_SCANS && !grew && !lastScrollMoved) {
         // Onboarding ends at the bottom. An update usually ends earlier, when
         // stored posts repeat, and only falls through to here if the timeline ends.
         await finishCollection("timeline_exhausted");
