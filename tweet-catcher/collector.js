@@ -254,28 +254,42 @@ function profileHasNoPosts() {
     && !!root.querySelector("[data-testid='UserName']");
 }
 
-// X replaces the profile with "This account doesn't exist" when the handle
-// is gone. There is no timeline to scroll. Missing that and failing the job
-// releases the lease, and the claim loop reloads the same profile.
+// X replaces the profile with this heading when the handle is gone. The
+// apostrophe in the English heading is U+2019, not ASCII. There is no timeline
+// to scroll. Missing it and failing the job releases the lease, and the claim
+// loop reloads the same profile.
 function profileAccountDoesNotExist() {
-  if (topLevelTweets().length > 0 || seenPostIds.size > 0) {
+  if (seenPostIds.size > 0) {
     return false;
   }
 
   const root = timelineRoot();
-  const empty = root.querySelector(
-    '[data-testid="emptyState"], [data-testid="empty_state_header_text"], [data-testid="empty_state_body_text"]'
+  const heading = root.querySelector(
+    '[data-testid="empty_state_header_text"], [data-testid="emptyState"]'
   );
-  const source = empty && isVisible(empty) ? empty : root;
-  const text = (source.innerText || "").replace(/\s+/g, " ");
-  const missing = /this account doesn['’‘]t exist|this account does not exist|dieses konto existiert nicht|dieser account existiert nicht/iu.test(text);
-  if (missing) {
+  // Posts in the profile column are a real timeline. Tweets left elsewhere
+  // on the page must not hide this heading.
+  const nodes = heading ? [heading] : [];
+  if (topLevelTweets(root).length === 0) {
+    nodes.push(root);
+  }
+  const raw = nodes.map(node => `${node.textContent || ""} ${node.innerText || ""}`).join(" ");
+  if (
+    raw.includes("This account doesn’t exist")
+    || raw.includes("This account doesn't exist")
+  ) {
     return true;
   }
-  if (!(empty && isVisible(empty))) {
-    return false;
-  }
-  return /try searching for another|versuche,?\s+nach einem anderen zu suchen/iu.test(text);
+
+  const text = raw
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u02BC\u00B4\uFF07]/g, "'")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  return text.includes("this account doesn't exist")
+    || text.includes("this account does not exist")
+    || text.includes("dieses konto existiert nicht")
+    || text.includes("dieser account existiert nicht")
+    || (!!heading && text.includes("try searching for another"));
 }
 
 function timelineIsLoadingMore() {
@@ -899,6 +913,27 @@ async function runCollector(job) {
       if (profileHasNoPosts()) {
         await finishCollection("no_posts");
         return;
+      }
+
+      // Nothing has rendered yet. Scrolling or kicking this page makes X reload
+      // a missing account ("This account doesn’t exist") before the next scan
+      // can mark it done. Wait for that heading, or for the first posts.
+      if (seenPostIds.size === 0 && topLevelTweets(timelineRoot()).length === 0) {
+        const emptyState = timelineRoot().querySelector(
+          '[data-testid="emptyState"], [data-testid="empty_state_header_text"]'
+        );
+        if (emptyState || emptyScans < 3) {
+          emptyScans++;
+          const stillLoading = timelineIsLoadingMore();
+          if (
+            (!stillLoading && emptyScans >= MAX_EMPTY_SCANS)
+            || emptyScans >= MAX_EMPTY_SCANS + MAX_LOADING_WAITS
+          ) {
+            throw new Error("No posts were visible. Check that X is logged in and the profile is public.");
+          }
+          await sleep(SCAN_DELAY_MS);
+          continue;
+        }
       }
 
       const waitingForText = unresolvedVisibleTweet();
