@@ -187,8 +187,46 @@ function profilePostsAreProtected() {
     || /diese (posts|tweets) sind geschützt/iu.test(text);
 }
 
-// A profile with nothing on the Posts tab. X replaces the timeline with this
-// empty state, so there is no bottom to scroll to and no spinner that ends.
+// The profile title under the display name, e.g. "0 posts" or "8,563 posts".
+// It comes from the account's post count, not from the timeline cells.
+function profileHeaderSaysNoPosts() {
+  const root = timelineRoot();
+  const nodes = root.querySelectorAll("div, span");
+  for (const node of nodes) {
+    if (node.childElementCount > 0) {
+      continue;
+    }
+    // Suggested accounts and bios can mention posting. The count sits in the
+    // title bar, above the Posts timeline.
+    if (node.closest("[aria-label^='Timeline:'], [data-testid='tweet'], [data-testid='UserCell'], [data-testid='UserDescription']")) {
+      continue;
+    }
+    const text = (node.textContent || "").replace(/\s+/g, " ").trim();
+    if (/^0\s+(posts?|tweets?|beiträge)$/iu.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function postsTabIsSelected() {
+  const tab = timelineRoot().querySelector("[role='tab'][aria-selected='true']");
+  if (!tab) {
+    return false;
+  }
+  const href = tab.getAttribute("href") || "";
+  if (/^\/[A-Za-z0-9_]{1,15}\/?$/.test(href)) {
+    return true;
+  }
+  const label = (tab.textContent || "").replace(/\s+/g, " ").trim();
+  return /^(posts|beiträge)$/iu.test(label);
+}
+
+// A profile with nothing on the Posts tab. X used to replace the timeline
+// with "hasn't posted". A logged-in empty profile now keeps the title
+// "0 posts" and fills the timeline with Who to follow, so there is still
+// no bottom to scroll to and no spinner that ends. Missing that and failing
+// the job releases the lease, and the claim loop reloads the same profile.
 function profileHasNoPosts() {
   if (topLevelTweets().length > 0 || seenPostIds.size > 0) {
     return false;
@@ -205,9 +243,15 @@ function profileHasNoPosts() {
   if (empty && isVisible(empty)) {
     return header || body;
   }
-  // Without the empty-state node, require both sentences so a bio that mentions
-  // posting does not finish the profile.
-  return header && body;
+  if (header && body) {
+    return true;
+  }
+
+  // The title count is already zero, and the Posts tab is the one on screen.
+  // Waiting for tweets here only scrolls, fails the lease, and reloads.
+  return profileHeaderSaysNoPosts()
+    && postsTabIsSelected()
+    && !!root.querySelector("[data-testid='UserName']");
 }
 
 function timelineIsLoadingMore() {
