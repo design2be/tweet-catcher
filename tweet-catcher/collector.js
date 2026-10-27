@@ -254,6 +254,30 @@ function profileHasNoPosts() {
     && !!root.querySelector("[data-testid='UserName']");
 }
 
+// X replaces the profile with "This account doesn't exist" when the handle
+// is gone. There is no timeline to scroll. Missing that and failing the job
+// releases the lease, and the claim loop reloads the same profile.
+function profileAccountDoesNotExist() {
+  if (topLevelTweets().length > 0 || seenPostIds.size > 0) {
+    return false;
+  }
+
+  const root = timelineRoot();
+  const empty = root.querySelector(
+    '[data-testid="emptyState"], [data-testid="empty_state_header_text"], [data-testid="empty_state_body_text"]'
+  );
+  const source = empty && isVisible(empty) ? empty : root;
+  const text = (source.innerText || "").replace(/\s+/g, " ");
+  const missing = /this account doesn['’‘]t exist|this account does not exist|dieses konto existiert nicht|dieser account existiert nicht/iu.test(text);
+  if (missing) {
+    return true;
+  }
+  if (!(empty && isVisible(empty))) {
+    return false;
+  }
+  return /try searching for another|versuche,?\s+nach einem anderen zu suchen/iu.test(text);
+}
+
 function timelineIsLoadingMore() {
   const progressbars = Array.from(timelineRoot().querySelectorAll('[role="progressbar"]')).filter(isVisible);
   return progressbars.some(element => element.getBoundingClientRect().top > window.innerHeight * 0.55)
@@ -864,6 +888,10 @@ async function runCollector(job) {
     while (collecting) {
       const waitingForExpansion = await expandTruncatedTweets();
       queuePosts(extractVisiblePosts());
+      if (profileAccountDoesNotExist()) {
+        await finishCollection("account_missing");
+        return;
+      }
       if (profilePostsAreProtected()) {
         await finishCollection("protected_posts");
         return;
