@@ -4,6 +4,7 @@ const SCAN_DELAY_MS = 1800;
 const MAX_EMPTY_SCANS = 8;
 const MAX_LOADING_WAITS = 12;
 const SAME_TWEET_SCANS = 4;
+const MAX_UNSETTLED_KICKS = 20;
 const MAX_EXPAND_ATTEMPTS = 3;
 const EXPAND_WAIT_MS = 1500;
 const HEARTBEAT_MS = 3 * 60 * 1000;
@@ -184,6 +185,29 @@ function profilePostsAreProtected() {
     || /\bprotected posts\b/i.test(text)
     || /\bposts are protected\b/i.test(text)
     || /diese (posts|tweets) sind geschützt/iu.test(text);
+}
+
+// A profile with nothing on the Posts tab. X replaces the timeline with this
+// empty state, so there is no bottom to scroll to and no spinner that ends.
+function profileHasNoPosts() {
+  if (topLevelTweets().length > 0 || seenPostIds.size > 0) {
+    return false;
+  }
+
+  const root = timelineRoot();
+  const empty = root.querySelector(
+    '[data-testid="emptyState"], [data-testid="empty_state_header_text"], [data-testid="empty_state_body_text"]'
+  );
+  const source = empty && isVisible(empty) ? empty : root;
+  const text = (source.innerText || "").replace(/\s+/g, " ");
+  const header = /hasn['’]t posted|haven['’]t posted|has not posted|have not posted|hat noch nicht gepostet|hat noch nichts gepostet|haben noch nicht gepostet|hast noch nicht gepostet/iu.test(text);
+  const body = /posts will show up here|werden (die )?posts hier angezeigt|sobald es soweit ist/iu.test(text);
+  if (empty && isVisible(empty)) {
+    return header || body;
+  }
+  // Without the empty-state node, require both sentences so a bio that mentions
+  // posting does not finish the profile.
+  return header && body;
 }
 
 function timelineIsLoadingMore() {
@@ -523,15 +547,58 @@ function cellOffset() {
   return cell.getBoundingClientRect().top;
 }
 
-function renderedEndIsVisible() {
-  const cell = markerCell();
-  if (!cell) {
+function pageIsVisible() {
+  return document.visibilityState === "visible";
+}
+
+// The lowest rendered timeline row. DOM order is not visual order: X positions
+// recycled rows with transforms, and empty spacers sit at the end of the list.
+function lowestTimelineCell() {
+  let best = null;
+  let bestBottom = -Infinity;
+  document.querySelectorAll('[data-testid="cellInnerDiv"]').forEach(cell => {
+    const rect = cell.getBoundingClientRect();
+    if (rect.height < 24 || rect.bottom <= 0) {
+      return;
+    }
+    if (rect.bottom > bestBottom) {
+      best = cell;
+      bestBottom = rect.bottom;
+    }
+  });
+  return best;
+}
+
+// X pins scrollTop to the current scroll height while it is still fetching.
+// For that moment the scrollbar is at the end, but the last rendered row sits
+// in the middle of the window with an empty gap under it. That gap is more
+// timeline, not the end of the profile. The tail is real only when the lowest
+// row rests on the bottom edge, or the whole profile fits without scrolling.
+function tailReachesWindowBottom() {
+  if (!pageIsVisible()) {
+    return false;
+  }
+  const cell = lowestTimelineCell();
+  if (!cell || cell.querySelector('[role="progressbar"]')) {
     return false;
   }
   const rect = cell.getBoundingClientRect();
-  // Virtualized rows keep a buffer below the viewport. The rendered end is only
-  // on screen once that buffer has been scrolled up to the window.
-  return rect.top < window.innerHeight && rect.bottom <= window.innerHeight + BOTTOM_SLOP;
+  if (rect.top >= window.innerHeight) {
+    return false;
+  }
+  if (windowHasRoom() || timelineHasRoom()) {
+    return false;
+  }
+
+  const doc = document.scrollingElement || document.documentElement;
+  const scrolled = doc.scrollTop > BOTTOM_SLOP || window.scrollY > BOTTOM_SLOP;
+  if (!scrolled) {
+    return rect.bottom > 0;
+  }
+
+  const band = Math.max(160, Math.round(window.innerHeight * 0.22));
+  return rect.bottom >= window.innerHeight - band
+    && rect.bottom <= window.innerHeight + BOTTOM_SLOP;
 }
 
 function windowHasRoom() {
@@ -568,11 +635,37 @@ function scrollFurther() {
   lastScrollMoved = timelineMoved || moved || docMoved || windowMoved;
 }
 
-async function retriggerLoader() {
-  const delta = Math.round(Math.max(window.innerHeight * 0.6, 360));
+function pinToEnd() {
+  const doc = document.scrollingElement || document.documentElement;
+  const scroller = chooseScroller();
+  if (scroller && scroller !== doc) {
+    scroller.scrollTop = scroller.scrollHeight;
+  }
+  const top = Math.max(doc.scrollHeight, scroller?.scrollHeight || 0);
+  doc.scrollTop = top;
+  window.scrollTo(0, top);
+}
+
+// Move off the end and pin back to it. A scrollTop that is already at the
+// maximum does not ask X for the next page, and the list then grows only
+// after another scroll gesture.
+async function kickTimeline() {
+  const delta = Math.round(Math.max(window.innerHeight * 0.9, 560));
+  const doc = document.scrollingElement || document.documentElement;
+  const scroller = chooseScroller();
+  const nudgeUp = node => {
+    if (!node) {
+      return;
+    }
+    node.scrollTop = Math.max(0, node.scrollTop - delta);
+  };
+  nudgeUp(scroller);
+  if (doc !== scroller) {
+    nudgeUp(doc);
+  }
   window.scrollBy(0, -delta);
-  await sleep(400);
-  window.scrollBy(0, delta);
+  await sleep(450);
+  pinToEnd();
   await sleep(SCAN_DELAY_MS);
 }
 
@@ -711,7 +804,7 @@ async function runCollector(job) {
   let emptyScans = 0;
   let loadingWaits = 0;
   let sameTweetScans = 0;
-  let stuckScans = 0;
+  let unsettledKicks = 0;
   let lastVisibleKey = "";
   let lastScrollHeight = 0;
 
@@ -731,6 +824,10 @@ async function runCollector(job) {
         await finishCollection("protected_posts");
         return;
       }
+      if (profileHasNoPosts()) {
+        await finishCollection("no_posts");
+        return;
+      }
 
       const waitingForText = unresolvedVisibleTweet();
       const loading = timelineIsLoadingMore();
@@ -746,17 +843,28 @@ async function runCollector(job) {
         return;
       }
 
+      // A covered or backgrounded window does not load the next page. Deciding
+      // the profile is finished from that frozen first screen leaves the rest
+      // of the timeline uncollected.
+      if (!pageIsVisible()) {
+        sameTweetScans = 0;
+        unsettledKicks = 0;
+        await sleep(SCAN_DELAY_MS);
+        continue;
+      }
+
       const visibleKey = visibleTweetKey();
       const scroller = chooseScroller();
       const doc = document.scrollingElement || document.documentElement;
       const timelineHeight = Math.max(scroller.scrollHeight, doc.scrollHeight);
       const grew = timelineHeight > lastScrollHeight + 40;
-      // The page can still be holding posts below the first screen while a nested
-      // box reports no room. Both the window and the rendered last cell have to
-      // be at the bottom before the profile can be marked done.
-      const atBottom = !windowHasRoom() && !timelineHasRoom() && renderedEndIsVisible();
+      // Scroll height can already be maxed while X is still appending posts.
+      // The lowest rendered row has to sit on the bottom edge of the window.
+      const atBottom = tailReachesWindowBottom();
+      const pinnedToEnd = !windowHasRoom() && !timelineHasRoom();
       if (grew) {
         lastScrollHeight = timelineHeight;
+        unsettledKicks = 0;
       }
 
       if (!visibleKey) {
@@ -768,8 +876,12 @@ async function runCollector(job) {
         if (emptyScans >= MAX_EMPTY_SCANS && seenPostIds.size === 0 && !loading) {
           throw new Error("No posts were visible. Check that X is logged in and the profile is public.");
         }
-        scrollFurther();
-        await sleep(SCAN_DELAY_MS + Math.floor(Math.random() * 700));
+        if (pinnedToEnd) {
+          await kickTimeline();
+        } else {
+          scrollFurther();
+          await sleep(SCAN_DELAY_MS + Math.floor(Math.random() * 700));
+        }
         continue;
       }
 
@@ -794,9 +906,15 @@ async function runCollector(job) {
         // instead of marking the profile fully scraped.
         if (waitingForText || waitingForExpansion || !atBottom || loadingWaits < MAX_LOADING_WAITS) {
           if (!waitingForText && !waitingForExpansion) {
-            scrollFurther();
+            if (pinnedToEnd) {
+              await kickTimeline();
+            } else {
+              scrollFurther();
+              await sleep(SCAN_DELAY_MS);
+            }
+          } else {
+            await sleep(SCAN_DELAY_MS);
           }
-          await sleep(SCAN_DELAY_MS);
           continue;
         }
         throw new Error(
@@ -809,12 +927,22 @@ async function runCollector(job) {
       if (!atBottom || lastScrollMoved) {
         if (lastScrollMoved || grew) {
           sameTweetScans = 0;
-          stuckScans = 0;
-        } else if (!windowHasRoom() && !timelineHasRoom()) {
-          stuckScans++;
-          if (stuckScans >= MAX_EMPTY_SCANS) {
-            throw new Error("The X timeline stopped loading before the bottom. Collection will retry.");
+        }
+        // Pinned to the current scroll height, but the last row is not on the
+        // bottom edge. Another page is still loading. Scrolling further is a
+        // no-op here, so step away from the end and pin back onto it.
+        if (pinnedToEnd && !lastScrollMoved) {
+          if (!grew) {
+            unsettledKicks++;
+            if (unsettledKicks >= MAX_UNSETTLED_KICKS) {
+              throw new Error("The X timeline stopped loading before the bottom. Collection will retry.");
+            }
           }
+          await kickTimeline();
+          continue;
+        }
+        if (!pinnedToEnd) {
+          unsettledKicks = 0;
         }
         scrollFurther();
         await sleep(SCAN_DELAY_MS + Math.floor(Math.random() * 700));
@@ -822,26 +950,35 @@ async function runCollector(job) {
       }
 
       loadingWaits = 0;
+      unsettledKicks = 0;
       sameTweetScans++;
       if (sameTweetScans >= SAME_TWEET_SCANS && !grew && !lastScrollMoved && atBottom) {
-        const seenBeforeKick = seenPostIds.size;
-        const heightBeforeKick = timelineHeight;
-        await retriggerLoader();
-        queuePosts(extractVisiblePosts());
-        const heightAfterKick = Math.max(
-          chooseScroller().scrollHeight,
-          (document.scrollingElement || document.documentElement).scrollHeight
-        );
-        if (
-          seenPostIds.size > seenBeforeKick
-          || heightAfterKick > heightBeforeKick + 40
-          || windowHasRoom()
-          || timelineHasRoom()
-          || timelineIsLoadingMore()
-          || !renderedEndIsVisible()
-        ) {
+        let heightBeforeKick = timelineHeight;
+        let stillAtEnd = true;
+        for (let attempt = 0; attempt < 2 && stillAtEnd && collecting; attempt++) {
+          const seenBeforeKick = seenPostIds.size;
+          await kickTimeline();
+          queuePosts(extractVisiblePosts());
+          const heightAfterKick = Math.max(
+            chooseScroller().scrollHeight,
+            (document.scrollingElement || document.documentElement).scrollHeight
+          );
+          if (
+            seenPostIds.size > seenBeforeKick
+            || heightAfterKick > heightBeforeKick + 40
+            || windowHasRoom()
+            || timelineHasRoom()
+            || timelineIsLoadingMore()
+            || timelineIsBlocked()
+            || !tailReachesWindowBottom()
+          ) {
+            stillAtEnd = false;
+            lastScrollHeight = heightAfterKick;
+          }
+          heightBeforeKick = heightAfterKick;
+        }
+        if (!stillAtEnd || !collecting) {
           sameTweetScans = 0;
-          lastScrollHeight = heightAfterKick;
           scrollFurther();
           await sleep(SCAN_DELAY_MS);
           continue;
