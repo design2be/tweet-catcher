@@ -12,6 +12,7 @@ const PENDING_PREVIEW_LIMIT = 40;
 
 let collecting = false;
 let stopping = false;
+let accountMissingFinishStarted = false;
 let currentJob = null;
 let pendingPosts = [];
 let seenPostIds = new Set();
@@ -254,42 +255,42 @@ function profileHasNoPosts() {
     && !!root.querySelector("[data-testid='UserName']");
 }
 
-// X replaces the profile with this heading when the handle is gone. The
-// apostrophe in the English heading is U+2019, not ASCII. There is no timeline
-// to scroll. Missing it and failing the job releases the lease, and the claim
-// loop reloads the same profile.
+// The English profile heading is "This account doesn’t exist" (U+2019). A
+// soft navigation keeps posts from the previous profile in memory, and that
+// must not hide this heading or the claim loop reloads the same page.
+function textSaysAccountDoesNotExist(value) {
+  const text = String(value || "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035\u02BC\u02BB\u00B4\uFF07\u0092']/g, "")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  return text.includes("this account doesnt exist")
+    || text.includes("this account does not exist")
+    || text.includes("dieses konto existiert nicht")
+    || text.includes("dieser account existiert nicht");
+}
+
 function profileAccountDoesNotExist() {
+  const headings = document.querySelectorAll('[data-testid="empty_state_header_text"]');
+  for (const heading of headings) {
+    if (
+      textSaysAccountDoesNotExist(heading.textContent)
+      || textSaysAccountDoesNotExist(heading.innerText)
+    ) {
+      return true;
+    }
+  }
+
   if (seenPostIds.size > 0) {
     return false;
   }
 
   const root = timelineRoot();
-  const heading = root.querySelector(
-    '[data-testid="empty_state_header_text"], [data-testid="emptyState"]'
-  );
-  // Posts in the profile column are a real timeline. Tweets left elsewhere
-  // on the page must not hide this heading.
-  const nodes = heading ? [heading] : [];
-  if (topLevelTweets(root).length === 0) {
-    nodes.push(root);
+  if (topLevelTweets(root).length > 0) {
+    return false;
   }
-  const raw = nodes.map(node => `${node.textContent || ""} ${node.innerText || ""}`).join(" ");
-  if (
-    raw.includes("This account doesn’t exist")
-    || raw.includes("This account doesn't exist")
-  ) {
-    return true;
-  }
-
-  const text = raw
-    .replace(/[\u2018\u2019\u201A\u201B\u2032\u02BC\u00B4\uFF07]/g, "'")
-    .replace(/\s+/g, " ")
-    .toLowerCase();
-  return text.includes("this account doesn't exist")
-    || text.includes("this account does not exist")
-    || text.includes("dieses konto existiert nicht")
-    || text.includes("dieser account existiert nicht")
-    || (!!heading && text.includes("try searching for another"));
+  return textSaysAccountDoesNotExist(root.textContent)
+    || textSaysAccountDoesNotExist(root.innerText);
 }
 
 function timelineIsLoadingMore() {
@@ -808,6 +809,7 @@ function watchTimeline() {
         return;
       }
       queuePosts(extractVisiblePosts());
+      finishIfAccountMissing();
     });
   });
   timelineObserver.observe(document.documentElement, { childList: true, subtree: true });
@@ -832,6 +834,25 @@ async function flushPosts(force = false) {
     pendingPosts.unshift(...batch);
     throw error;
   }
+}
+
+function finishIfAccountMissing() {
+  if (accountMissingFinishStarted || stopping || !collecting || !profileAccountDoesNotExist()) {
+    return;
+  }
+  accountMissingFinishStarted = true;
+  finishCollection("account_missing").catch(error => {
+    accountMissingFinishStarted = false;
+    collecting = false;
+    clearInterval(heartbeatTimer);
+    if (!stopping) {
+      sendCollectorMessage({
+        type: "FAIL_COLLECTION",
+        message: error.message,
+        recoverable: true
+      }).catch(() => {});
+    }
+  });
 }
 
 async function finishCollection(reason, hasMore = false) {
@@ -872,6 +893,7 @@ async function runCollector(job) {
 
   collecting = true;
   stopping = false;
+  accountMissingFinishStarted = false;
   currentJob = job;
   pendingPosts = [];
   seenPostIds = new Set();
@@ -900,9 +922,15 @@ async function runCollector(job) {
 
   try {
     while (collecting) {
+      if (profileAccountDoesNotExist()) {
+        accountMissingFinishStarted = true;
+        await finishCollection("account_missing");
+        return;
+      }
       const waitingForExpansion = await expandTruncatedTweets();
       queuePosts(extractVisiblePosts());
       if (profileAccountDoesNotExist()) {
+        accountMissingFinishStarted = true;
         await finishCollection("account_missing");
         return;
       }
