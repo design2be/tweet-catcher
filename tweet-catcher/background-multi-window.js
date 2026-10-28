@@ -399,18 +399,26 @@ async function heartbeat(sender) {
 async function completeJob(sender, reason, hasMore, jobId) {
   const job = await senderJob(sender);
   if (!job || finishingJobs.has(job.jobId)) {
-    return;
+    return false;
   }
   if (jobId !== undefined && jobId !== null && String(job.jobId) !== String(jobId)) {
-    return;
+    return false;
   }
   finishingJobs.add(job.jobId);
   let shouldClaimNext = false;
 
   try {
+    // Older API deployments already finish "no_posts", but do not know the
+    // "account_missing" reason yet. The explicit flag lets updated APIs store
+    // account_missing permanently while old APIs still complete the job.
+    const accountMissing = reason === "account_missing";
     const result = await apiRequest(
       `/${job.jobId}/complete`,
-      { reason: reason || "timeline_exhausted", hasMore: !!hasMore },
+      {
+        reason: accountMissing ? "no_posts" : (reason || "timeline_exhausted"),
+        accountMissing,
+        hasMore: !!hasMore
+      },
       job
     );
     hasMore = !!result.hasMore;
@@ -436,6 +444,22 @@ async function completeJob(sender, reason, hasMore, jobId) {
   if (shouldClaimNext) {
     await claimNext(job.windowId, job.tabId, true);
   }
+  return true;
+}
+
+async function completeMissingAccount(sender) {
+  const job = await senderJob(sender);
+  if (!job || !sender.tab || !sameProfile(sender.tab.url, job.profile.url)) {
+    return false;
+  }
+
+  await updateState(job.windowId, {
+    phase: "completing",
+    message: `X reports @${job.profile.xHandle} does not exist. Marking it done…`,
+    profile: job.profile,
+    jobId: job.jobId
+  });
+  return completeJob(sender, "account_missing", false, job.jobId);
 }
 
 async function failJob(windowId, message, recoverable = true, knownJob = null) {
@@ -544,6 +568,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       case "COLLECTOR_HEARTBEAT":
         return { ok: true, result: await heartbeat(sender) };
+
+      case "ACCOUNT_MISSING_ON_SCREEN":
+        return { ok: true, completed: await completeMissingAccount(sender) };
 
       case "COMPLETE_COLLECTION":
         await completeJob(sender, message.reason, message.hasMore, message.jobId);

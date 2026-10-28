@@ -14,6 +14,7 @@ let collecting = false;
 let stopping = false;
 let collectionGeneration = 0;
 let accountMissingFinishStarted = false;
+let accountMissingReportPending = false;
 let currentJob = null;
 let pendingPosts = [];
 let seenPostIds = new Set();
@@ -269,8 +270,8 @@ function visibleText(node) {
 
 // The words on the screen. English: "This account doesn’t exist".
 // German: "Dieser Account existiert nicht" / "Dieses Konto existiert nicht".
-// Only the empty-state heading is read. The rest of the page includes scripts
-// and would freeze the collector before it can open the next profile.
+// Read rendered text, never textContent: X keeps hidden application data in
+// the document, but innerText is the text actually shown to the user.
 function profileAccountDoesNotExist(thorough = false) {
   const heading = document.querySelector("[data-testid='empty_state_header_text']");
   const empty = document.querySelector("[data-testid='emptyState']");
@@ -281,20 +282,40 @@ function profileAccountDoesNotExist(thorough = false) {
     return false;
   }
   const column = document.querySelector("[data-testid='primaryColumn']");
-  if (!column || column.querySelector("[data-testid='tweet']")) {
-    return false;
-  }
-  return missingAccountCopy(visibleText(column));
+  return missingAccountCopy(visibleText(column) || visibleText(document.body));
 }
 
 function missingAccountCopy(value) {
   const text = String(value || "")
     .toLowerCase()
-    .replace(/[\u2018\u2019\u201a\u201b\u2032`´]/g, "'");
+    .replace(/[\u2018\u2019\u201a\u201b\u2032`´]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
   return text.includes("this account doesn't exist")
     || text.includes("this account does not exist")
     || text.includes("dieser account existiert nicht")
     || text.includes("dieses konto existiert nicht");
+}
+
+async function reportMissingAccountOnScreen() {
+  if (accountMissingReportPending || !profileAccountDoesNotExist(true)) {
+    return;
+  }
+
+  accountMissingReportPending = true;
+  try {
+    const response = await sendCollectorMessage({ type: "ACCOUNT_MISSING_ON_SCREEN" });
+    if (response.completed) {
+      collecting = false;
+      stopping = true;
+      clearInterval(heartbeatTimer);
+      stopWatchingTimeline();
+    }
+  } catch (error) {
+    console.warn("Tweet Catcher could not mark the missing account done:", error);
+  } finally {
+    accountMissingReportPending = false;
+  }
 }
 
 function timelineIsLoadingMore() {
@@ -1203,3 +1224,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 connectToCollector();
+
+// Missing-account pages do not have a timeline. Detect their visible message
+// independently of timeline collection so they are completed even if X
+// renders the empty state before or after the collector loop starts.
+reportMissingAccountOnScreen();
+setInterval(reportMissingAccountOnScreen, 750);
