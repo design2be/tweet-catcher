@@ -255,42 +255,18 @@ function profileHasNoPosts() {
     && !!root.querySelector("[data-testid='UserName']");
 }
 
-// The English profile heading is "This account doesn’t exist" (U+2019). A
-// soft navigation keeps posts from the previous profile in memory, and that
-// must not hide this heading or the claim loop reloads the same page.
-function textSaysAccountDoesNotExist(value) {
-  const text = String(value || "")
+// English: "This account doesn’t exist". German: "Dieser Account existiert nicht".
+function profileAccountDoesNotExist() {
+  const root = document.documentElement;
+  const text = `${root?.innerText || ""} ${root?.textContent || ""}`
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035\u02BC\u02BB\u00B4\uFF07\u0092']/g, "")
     .replace(/\s+/g, " ")
     .toLowerCase();
   return text.includes("this account doesnt exist")
     || text.includes("this account does not exist")
-    || text.includes("dieses konto existiert nicht")
-    || text.includes("dieser account existiert nicht");
-}
-
-function profileAccountDoesNotExist() {
-  const headings = document.querySelectorAll('[data-testid="empty_state_header_text"]');
-  for (const heading of headings) {
-    if (
-      textSaysAccountDoesNotExist(heading.textContent)
-      || textSaysAccountDoesNotExist(heading.innerText)
-    ) {
-      return true;
-    }
-  }
-
-  if (seenPostIds.size > 0) {
-    return false;
-  }
-
-  const root = timelineRoot();
-  if (topLevelTweets(root).length > 0) {
-    return false;
-  }
-  return textSaysAccountDoesNotExist(root.textContent)
-    || textSaysAccountDoesNotExist(root.innerText);
+    || text.includes("dieser account existiert nicht")
+    || text.includes("dieses konto existiert nicht");
 }
 
 function timelineIsLoadingMore() {
