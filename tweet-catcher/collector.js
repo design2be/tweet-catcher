@@ -12,6 +12,7 @@ const PENDING_PREVIEW_LIMIT = 40;
 
 let collecting = false;
 let stopping = false;
+let collectionGeneration = 0;
 let accountMissingFinishStarted = false;
 let currentJob = null;
 let pendingPosts = [];
@@ -255,25 +256,42 @@ function profileHasNoPosts() {
     && !!root.querySelector("[data-testid='UserName']");
 }
 
+function visibleText(node) {
+  if (!node) {
+    return "";
+  }
+  try {
+    return node.innerText || "";
+  } catch (error) {
+    return "";
+  }
+}
+
 // The words on the screen. English: "This account doesn’t exist".
-// German: "Dieser Account existiert nicht".
-function profileAccountDoesNotExist() {
-  const parts = [];
-  if (document.body) {
-    try {
-      parts.push(document.body.innerText || "");
-    } catch (error) {
-      // innerText can throw when the screen text is not readable yet.
-    }
-    parts.push(document.body.textContent || "");
-  }
+// German: "Dieser Account existiert nicht" / "Dieses Konto existiert nicht".
+// Only the empty-state heading is read. The rest of the page includes scripts
+// and would freeze the collector before it can open the next profile.
+function profileAccountDoesNotExist(thorough = false) {
   const heading = document.querySelector("[data-testid='empty_state_header_text']");
-  if (heading) {
-    parts.push(heading.textContent || "");
+  const empty = document.querySelector("[data-testid='emptyState']");
+  if (heading || empty) {
+    return missingAccountCopy(`${visibleText(heading)}\n${visibleText(empty)}`);
   }
-  const text = parts.join("\n").toLowerCase();
-  return text.includes("this account doesn\u2019t exist")
-    || text.includes("this account doesn't exist")
+  if (!thorough) {
+    return false;
+  }
+  const column = document.querySelector("[data-testid='primaryColumn']");
+  if (!column || column.querySelector("[data-testid='tweet']")) {
+    return false;
+  }
+  return missingAccountCopy(visibleText(column));
+}
+
+function missingAccountCopy(value) {
+  const text = String(value || "")
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u201a\u201b\u2032`´]/g, "'");
+  return text.includes("this account doesn't exist")
     || text.includes("this account does not exist")
     || text.includes("dieser account existiert nicht")
     || text.includes("dieses konto existiert nicht");
@@ -827,7 +845,12 @@ function finishIfAccountMissing() {
     return;
   }
   accountMissingFinishStarted = true;
+  const generation = collectionGeneration;
+  const jobId = currentJob && currentJob.jobId;
   finishCollection("account_missing").catch(error => {
+    if (generation !== collectionGeneration) {
+      return;
+    }
     accountMissingFinishStarted = false;
     collecting = false;
     clearInterval(heartbeatTimer);
@@ -835,13 +858,16 @@ function finishIfAccountMissing() {
       sendCollectorMessage({
         type: "FAIL_COLLECTION",
         message: error.message,
-        recoverable: true
+        recoverable: true,
+        jobId
       }).catch(() => {});
     }
   });
 }
 
 async function finishCollection(reason, hasMore = false) {
+  const generation = collectionGeneration;
+  const jobId = currentJob && currentJob.jobId;
   if (stopping) {
     return;
   }
@@ -860,9 +886,12 @@ async function finishCollection(reason, hasMore = false) {
       await sendCollectorMessage({
         type: "COMPLETE_COLLECTION",
         reason,
-        hasMore
+        hasMore,
+        jobId
       });
-      stopping = true;
+      if (generation === collectionGeneration) {
+        stopping = true;
+      }
       return;
     } catch (error) {
       lastError = error;
@@ -877,6 +906,9 @@ async function runCollector(job) {
     return;
   }
 
+  collectionGeneration++;
+  const generation = collectionGeneration;
+  const activeJobId = job.jobId;
   collecting = true;
   stopping = false;
   accountMissingFinishStarted = false;
@@ -908,14 +940,14 @@ async function runCollector(job) {
 
   try {
     while (collecting) {
-      if (profileAccountDoesNotExist()) {
+      if (profileAccountDoesNotExist(true)) {
         accountMissingFinishStarted = true;
         await finishCollection("account_missing");
         return;
       }
       const waitingForExpansion = await expandTruncatedTweets();
       queuePosts(extractVisiblePosts());
-      if (profileAccountDoesNotExist()) {
+      if (profileAccountDoesNotExist(true)) {
         accountMissingFinishStarted = true;
         await finishCollection("account_missing");
         return;
@@ -932,7 +964,7 @@ async function runCollector(job) {
       // No posts yet. Do not scroll. Scrolling this screen makes X reload a
       // missing account before its heading can be read.
       if (seenPostIds.size === 0 && topLevelTweets(timelineRoot()).length === 0) {
-        if (profileAccountDoesNotExist()) {
+        if (profileAccountDoesNotExist(true)) {
           accountMissingFinishStarted = true;
           await finishCollection("account_missing");
           return;
@@ -943,7 +975,7 @@ async function runCollector(job) {
           (!stillLoading && emptyScans >= MAX_EMPTY_SCANS)
           || emptyScans >= MAX_EMPTY_SCANS + MAX_LOADING_WAITS
         ) {
-          if (profileAccountDoesNotExist()) {
+          if (profileAccountDoesNotExist(true)) {
             accountMissingFinishStarted = true;
             await finishCollection("account_missing");
             return;
@@ -1124,6 +1156,9 @@ async function runCollector(job) {
       await sleep(SCAN_DELAY_MS + Math.floor(Math.random() * 700));
     }
   } catch (error) {
+    if (generation !== collectionGeneration) {
+      return;
+    }
     collecting = false;
     clearInterval(heartbeatTimer);
     if (!stopping) {
@@ -1131,11 +1166,14 @@ async function runCollector(job) {
       await sendCollectorMessage({
         type: "FAIL_COLLECTION",
         message: error.message,
-        recoverable: true
+        recoverable: true,
+        jobId: activeJobId
       }).catch(() => {});
     }
   } finally {
-    stopWatchingTimeline();
+    if (generation === collectionGeneration) {
+      stopWatchingTimeline();
+    }
   }
 }
 

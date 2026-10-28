@@ -214,19 +214,19 @@ async function openProfile(job) {
     throw new Error("The X tab navigated away before collection started.");
   }
 
-  // Opening the same profile again reloads the tab. A missing account then
-  // reloads forever instead of being marked done.
-  if (sameProfile(tab.url, job.profile.url)) {
-    try {
-      await chrome.tabs.sendMessage(tab.id, { type: "COLLECT_PROFILE" });
-    } catch (error) {
-      const message = String(error && error.message || "");
-      if (/Receiving end does not exist|Could not establish connection/i.test(message)) {
-        await chrome.tabs.update(tab.id, { url: job.profile.url });
-      }
-    }
-  } else {
+  // A different handle always navigates. Reloading the handle already on
+  // screen is what trapped a missing account in a reload loop, so that case
+  // only asks the content script to read the page. The message is not awaited:
+  // this function runs while that script is still waiting for collection to finish.
+  if (!sameProfile(tab.url, job.profile.url)) {
     await chrome.tabs.update(tab.id, { url: job.profile.url });
+  } else {
+    chrome.tabs.sendMessage(tab.id, { type: "COLLECT_PROFILE" }, () => {
+      const message = chrome.runtime.lastError && chrome.runtime.lastError.message || "";
+      if (/Receiving end does not exist|Could not establish connection/i.test(message)) {
+        chrome.tabs.update(tab.id, { url: job.profile.url });
+      }
+    });
   }
   await updateState(job.windowId, {
     phase: "opening_profile",
@@ -242,9 +242,28 @@ async function openProfile(job) {
   });
 }
 
-async function claimNext(windowId, preferredTabId = null) {
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function claimNext(windowId, preferredTabId = null, force = false) {
   const key = windowKey(windowId);
-  if (claimingWindows.has(key) || await jobForWindow(windowId)) {
+  if (claimingWindows.has(key)) {
+    if (!force) {
+      return;
+    }
+    for (let attempt = 0; attempt < 40 && claimingWindows.has(key); attempt++) {
+      await wait(50);
+    }
+  }
+
+  const existing = await jobForWindow(windowId);
+  if (existing) {
+    if (!force) {
+      return;
+    }
+    // A claim already stored the next profile but never opened it.
+    await openProfile(existing);
     return;
   }
 
@@ -377,9 +396,12 @@ async function heartbeat(sender) {
   return result;
 }
 
-async function completeJob(sender, reason, hasMore) {
+async function completeJob(sender, reason, hasMore, jobId) {
   const job = await senderJob(sender);
   if (!job || finishingJobs.has(job.jobId)) {
+    return;
+  }
+  if (jobId !== undefined && jobId !== null && String(job.jobId) !== String(jobId)) {
     return;
   }
   finishingJobs.add(job.jobId);
@@ -412,7 +434,7 @@ async function completeJob(sender, reason, hasMore) {
   }
 
   if (shouldClaimNext) {
-    await claimNext(job.windowId, job.tabId);
+    await claimNext(job.windowId, job.tabId, true);
   }
 }
 
@@ -524,12 +546,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ok: true, result: await heartbeat(sender) };
 
       case "COMPLETE_COLLECTION":
-        await completeJob(sender, message.reason, message.hasMore);
+        await completeJob(sender, message.reason, message.hasMore, message.jobId);
         return { ok: true };
 
       case "FAIL_COLLECTION": {
         const job = await senderJob(sender);
-        if (job) {
+        if (job && (message.jobId === undefined || message.jobId === null || String(job.jobId) === String(message.jobId))) {
           await failJob(job.windowId, message.message, message.recoverable !== false, job);
         }
         return { ok: true };

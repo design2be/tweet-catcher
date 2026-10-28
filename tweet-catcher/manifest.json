@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tweet Catcher",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Collects person posts from X for the MissPredict onboarding pipeline.",
   "permissions": ["storage", "tabs"],
   "host_permissions": ["https://x.com/*"],
