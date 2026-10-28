@@ -235,4 +235,6 @@ chrome.storage.local.get("collectorSettings", data => {
   collectorId.value = settings.collectorId;
 });
 
+document.querySelector("h1").textContent = "Tweet Catcher " + chrome.runtime.getManifest().version;
+
 refreshState();

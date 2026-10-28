@@ -187,6 +187,21 @@ async function activeXTabs() {
   return tabs.filter(tab => tab.windowId >= 0 && isXUrl(tab.url));
 }
 
+function sameProfile(tabUrl, profileUrl) {
+  try {
+    const current = new URL(tabUrl);
+    const target = new URL(profileUrl);
+    if (current.hostname !== target.hostname) {
+      return false;
+    }
+    const currentPath = current.pathname.replace(/\/+$/, "").toLowerCase();
+    const targetPath = target.pathname.replace(/\/+$/, "").toLowerCase();
+    return currentPath === targetPath;
+  } catch (error) {
+    return false;
+  }
+}
+
 async function openProfile(job) {
   let tab;
   try {
@@ -199,7 +214,20 @@ async function openProfile(job) {
     throw new Error("The X tab navigated away before collection started.");
   }
 
-  await chrome.tabs.update(tab.id, { url: job.profile.url });
+  // Opening the same profile again reloads the tab. A missing account then
+  // reloads forever instead of being marked done.
+  if (sameProfile(tab.url, job.profile.url)) {
+    try {
+      await chrome.tabs.sendMessage(tab.id, { type: "COLLECT_PROFILE" });
+    } catch (error) {
+      const message = String(error && error.message || "");
+      if (/Receiving end does not exist|Could not establish connection/i.test(message)) {
+        await chrome.tabs.update(tab.id, { url: job.profile.url });
+      }
+    }
+  } else {
+    await chrome.tabs.update(tab.id, { url: job.profile.url });
+  }
   await updateState(job.windowId, {
     phase: "opening_profile",
     message: `Opening @${job.profile.xHandle}`,

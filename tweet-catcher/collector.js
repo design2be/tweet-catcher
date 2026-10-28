@@ -255,15 +255,25 @@ function profileHasNoPosts() {
     && !!root.querySelector("[data-testid='UserName']");
 }
 
-// English: "This account doesn’t exist". German: "Dieser Account existiert nicht".
+// The words on the screen. English: "This account doesn’t exist".
+// German: "Dieser Account existiert nicht".
 function profileAccountDoesNotExist() {
-  const root = document.documentElement;
-  const text = `${root?.innerText || ""} ${root?.textContent || ""}`
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035\u02BC\u02BB\u00B4\uFF07\u0092']/g, "")
-    .replace(/\s+/g, " ")
-    .toLowerCase();
-  return text.includes("this account doesnt exist")
+  const parts = [];
+  if (document.body) {
+    try {
+      parts.push(document.body.innerText || "");
+    } catch (error) {
+      // innerText can throw when the screen text is not readable yet.
+    }
+    parts.push(document.body.textContent || "");
+  }
+  const heading = document.querySelector("[data-testid='empty_state_header_text']");
+  if (heading) {
+    parts.push(heading.textContent || "");
+  }
+  const text = parts.join("\n").toLowerCase();
+  return text.includes("this account doesn\u2019t exist")
+    || text.includes("this account doesn't exist")
     || text.includes("this account does not exist")
     || text.includes("dieser account existiert nicht")
     || text.includes("dieses konto existiert nicht");
@@ -919,25 +929,29 @@ async function runCollector(job) {
         return;
       }
 
-      // Nothing has rendered yet. Scrolling or kicking this page makes X reload
-      // a missing account ("This account doesn’t exist") before the next scan
-      // can mark it done. Wait for that heading, or for the first posts.
+      // No posts yet. Do not scroll. Scrolling this screen makes X reload a
+      // missing account before its heading can be read.
       if (seenPostIds.size === 0 && topLevelTweets(timelineRoot()).length === 0) {
-        const emptyState = timelineRoot().querySelector(
-          '[data-testid="emptyState"], [data-testid="empty_state_header_text"]'
-        );
-        if (emptyState || emptyScans < 3) {
-          emptyScans++;
-          const stillLoading = timelineIsLoadingMore();
-          if (
-            (!stillLoading && emptyScans >= MAX_EMPTY_SCANS)
-            || emptyScans >= MAX_EMPTY_SCANS + MAX_LOADING_WAITS
-          ) {
-            throw new Error("No posts were visible. Check that X is logged in and the profile is public.");
-          }
-          await sleep(SCAN_DELAY_MS);
-          continue;
+        if (profileAccountDoesNotExist()) {
+          accountMissingFinishStarted = true;
+          await finishCollection("account_missing");
+          return;
         }
+        emptyScans++;
+        const stillLoading = timelineIsLoadingMore();
+        if (
+          (!stillLoading && emptyScans >= MAX_EMPTY_SCANS)
+          || emptyScans >= MAX_EMPTY_SCANS + MAX_LOADING_WAITS
+        ) {
+          if (profileAccountDoesNotExist()) {
+            accountMissingFinishStarted = true;
+            await finishCollection("account_missing");
+            return;
+          }
+          throw new Error("No posts were visible. Check that X is logged in and the profile is public.");
+        }
+        await sleep(SCAN_DELAY_MS);
+        continue;
       }
 
       const waitingForText = unresolvedVisibleTweet();
@@ -1125,15 +1139,7 @@ async function runCollector(job) {
   }
 }
 
-chrome.runtime.onMessage.addListener(message => {
-  if (message?.type === "STOP_COLLECTION") {
-    collecting = false;
-    stopping = true;
-    clearInterval(heartbeatTimer);
-  }
-});
-
-(async function connectToCollector() {
+async function connectToCollector() {
   try {
     const response = await sendCollectorMessage({ type: "COLLECTOR_READY" });
     if (response.job) {
@@ -1142,4 +1148,20 @@ chrome.runtime.onMessage.addListener(message => {
   } catch (error) {
     console.warn("Tweet Catcher could not connect to the collector:", error);
   }
-})();
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "STOP_COLLECTION") {
+    collecting = false;
+    stopping = true;
+    clearInterval(heartbeatTimer);
+    sendResponse({ ok: true });
+    return;
+  }
+  if (message?.type === "COLLECT_PROFILE") {
+    connectToCollector();
+    sendResponse({ ok: true });
+  }
+});
+
+connectToCollector();
