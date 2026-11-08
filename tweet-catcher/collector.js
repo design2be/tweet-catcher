@@ -294,7 +294,17 @@ function missingAccountCopy(value) {
   return text.includes("this account doesn't exist")
     || text.includes("this account does not exist")
     || text.includes("dieser account existiert nicht")
-    || text.includes("dieses konto existiert nicht");
+    || text.includes("dieses konto existiert nicht")
+    || accountSuspendedCopy(text);
+}
+
+// The words on the screen. English: "Account suspended" above "X suspends
+// accounts which violate the X Rules". German: "Account gesperrt" above
+// "X sperrt Accounts, die gegen die X Regeln verstoßen". Both lines must be
+// present so a post quoting "account suspended" does not end the collection.
+function accountSuspendedCopy(text) {
+  return (text.includes("account suspended") && text.includes("x suspends accounts"))
+    || (text.includes("account gesperrt") && text.includes("x sperrt accounts"));
 }
 
 async function reportMissingAccountOnScreen() {
